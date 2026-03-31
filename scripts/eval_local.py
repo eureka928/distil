@@ -75,7 +75,7 @@ def generate_teacher_cache(
     tokenizer = AutoTokenizer.from_pretrained(teacher_model_name, trust_remote_code=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         teacher_model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -157,7 +157,7 @@ def evaluate_student(
     student = AutoModelForCausalLM.from_pretrained(
         student_repo,
         revision=revision,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         trust_remote_code=True,
     )

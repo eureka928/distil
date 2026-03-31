@@ -66,9 +66,9 @@ def main(teacher_model, num_prompts, num_blocks, output_dir, device, teacher_pre
             )
         except ImportError:
             logger.warning("bitsandbytes not available, falling back to bf16")
-            load_kwargs["torch_dtype"] = torch.bfloat16
+            load_kwargs["dtype"] = torch.bfloat16
     else:
-        load_kwargs["torch_dtype"] = torch.bfloat16
+        load_kwargs["dtype"] = torch.bfloat16
     logger.info(f"Loading teacher ({teacher_precision})...")
 
     teacher = AutoModelForCausalLM.from_pretrained(teacher_model, **load_kwargs)

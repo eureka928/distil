@@ -249,7 +249,7 @@ def main(
     else:
         teacher = AutoModelForCausalLM.from_pretrained(
             teacher_model,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
         )
@@ -263,7 +263,7 @@ def main(
     student = AutoModelForCausalLM.from_pretrained(
         resume_from or student_repo,
         revision=None if resume_from else student_revision,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         trust_remote_code=True,
     )
