@@ -951,10 +951,20 @@ else:
                                 progress["pod"] = pod_progress
                                 pod_phase = pod_progress.get("phase", "scoring")
                                 progress["phase"] = pod_phase
-                                if pod_phase == "teacher_generation":
+
+                                # Teacher phases (generation, logit extraction, cache load)
+                                if pod_phase in ("teacher_generation", "teacher_logits",
+                                                 "teacher_loading", "vllm_starting",
+                                                 "vllm_generating"):
                                     progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
                                     progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
-                                elif pod_progress.get("current"):
+                                    # Clear student fields during teacher phase
+                                    progress.pop("current_student", None)
+                                    progress.pop("current_prompt", None)
+                                    progress.pop("current_kl", None)
+
+                                # Student scoring phase
+                                if pod_progress.get("current"):
                                     cur = pod_progress["current"]
                                     progress["current_student"] = cur.get("student_name")
                                     progress["current_prompt"] = cur.get("prompts_done", 0)
@@ -962,8 +972,17 @@ else:
                                     progress["current_se"] = cur.get("kl_running_se")
                                     progress["current_ci"] = cur.get("ci_95")
                                     progress["current_best"] = cur.get("best_kl_so_far")
-                                    progress["students_done"] = cur.get("student_idx", 0)
-                                progress["completed"] = pod_progress.get("completed", [])
+                                elif pod_phase == "scoring":
+                                    # Scoring phase but no current student — between models
+                                    progress.pop("current_student", None)
+                                    progress.pop("current_prompt", None)
+                                    progress.pop("current_kl", None)
+
+                                # Always update completed count
+                                pod_completed = pod_progress.get("completed", [])
+                                progress["completed"] = pod_completed
+                                progress["students_done"] = len(pod_completed)
+
                                 with open(progress_path, "w") as f:
                                     json.dump(progress, f)
                         except Exception:

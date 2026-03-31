@@ -316,6 +316,25 @@ def main():
         prompts = json.load(f)
     prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
 
+    # Progress file — written throughout for live dashboard updates
+    progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+    def _write_phase(phase, teacher_done=None, **extra):
+        """Write a phase update to the progress file for the dashboard."""
+        try:
+            data = {
+                "phase": phase,
+                "students": students,
+                "students_total": len(students),
+                "prompts_total": len(prompts),
+                "teacher_prompts_done": teacher_done,
+                "completed": extra.get("completed", []),
+                "current": extra.get("current", None),
+            }
+            with open(progress_path, "w") as pf:
+                json.dump(data, pf)
+        except Exception:
+            pass
+
     print(f"[eval] {len(prompts)} prompts (hash={prompts_hash}), {len(students)} students", flush=True)
     print(f"[eval] Teacher: {args.teacher}", flush=True)
     print(f"[eval] King: {args.king or 'none'}", flush=True)
@@ -365,12 +384,14 @@ def main():
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
+        _write_phase("vllm_starting")
         t0 = time.time()
         vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
         timings["vllm_startup"] = time.time() - t0
 
         sequences_data = None
         if vllm_ok:
+            _write_phase("vllm_generating")
             t0 = time.time()
             try:
                 sequences_data = generate_via_vllm(prompts, tokenizer, args.max_new_tokens, args.block_seed)
@@ -394,24 +415,7 @@ def main():
             timings["teacher_hf_load"] = time.time() - t0
             print(f"[eval] HF teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-            # Progress reporting for teacher logits
-            progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
-            def _write_teacher_progress(done, total):
-                try:
-                    with open(progress_path, "w") as pf:
-                        json.dump({
-                            "phase": "teacher_logits",
-                            "students": students,
-                            "students_total": len(students),
-                            "prompts_total": total,
-                            "teacher_prompts_done": done,
-                            "completed": [],
-                            "current": None,
-                        }, pf)
-                except Exception:
-                    pass
-
-            _write_teacher_progress(0, len(sequences_data))
+            _write_phase("teacher_logits", teacher_done=0)
             t0 = time.time()
             with torch.no_grad():
                 for i, data in enumerate(sequences_data):
@@ -425,7 +429,7 @@ def main():
                     del logits, cont_logits
                     if (i + 1) % 10 == 0 or i == len(sequences_data) - 1:
                         print(f"  Logits [{i+1}/{len(sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
-                    _write_teacher_progress(i + 1, len(sequences_data))
+                    _write_phase("teacher_logits", teacher_done=i + 1)
 
             timings["teacher_logits_pass"] = time.time() - t0
             print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
@@ -462,23 +466,7 @@ def main():
         timings["teacher_hf_load"] = time.time() - t0
         print(f"[eval] Teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-        progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
-        def _write_teacher_progress(done, total):
-            try:
-                with open(progress_path, "w") as pf:
-                    json.dump({
-                        "phase": "teacher_generation",
-                        "students": students,
-                        "students_total": len(students),
-                        "prompts_total": total,
-                        "teacher_prompts_done": done,
-                        "completed": [],
-                        "current": None,
-                    }, pf)
-            except Exception:
-                pass
-
-        _write_teacher_progress(0, len(input_ids_list))
+        _write_phase("teacher_generation", teacher_done=0)
         t0 = time.time()
         with torch.no_grad():
             for i, ids in enumerate(input_ids_list):
@@ -500,7 +488,7 @@ def main():
                 del logits, cont_logits
                 gen_len = output_ids.shape[1] - prompt_len
                 print(f"  Prompt {i}: {prompt_len}+{gen_len} tokens, VRAM: {gpu_mem_str()}", flush=True)
-                _write_teacher_progress(i + 1, len(input_ids_list))
+                _write_phase("teacher_generation", teacher_done=i + 1)
 
         timings["teacher_generation"] = time.time() - t0
         cache_path = args.save_teacher_logits or os.path.join(
@@ -578,8 +566,7 @@ def main():
         if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None:
             results["students"][name] = data
 
-    # Progress
-    progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+    # Progress (progress_path already defined at top of main)
     progress_lock = threading.Lock()
     live_progress = {
         "phase": "scoring",
