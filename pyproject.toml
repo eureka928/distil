@@ -23,6 +23,11 @@ dev = [
 gpu = [
     "flash-attn>=2.5.0",
 ]
+train = [
+    "datasets>=2.14.0",
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.25.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["eval*", "api*", "sim*"]
