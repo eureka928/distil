@@ -815,12 +815,16 @@ def _lium_pod(name_hint="chat-king"):
     return None, None
 
 
+from fastapi.responses import StreamingResponse
+
+
 @app.post("/api/chat")
 async def chat_with_king(request: Request):
-    """Proxy chat to the king model running on the GPU pod."""
+    """Proxy chat to the king model running on the GPU pod. Supports streaming via stream=true."""
     body = await request.json()
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 2048)  # No hard cap
+    max_tokens = body.get("max_tokens", 2048)
+    stream = body.get("stream", False)
 
     if not messages:
         return {"error": "messages required"}
@@ -834,41 +838,117 @@ async def chat_with_king(request: Request):
         if not pod:
             return {"error": "GPU pod not found"}
 
-        payload = json.dumps({
+        pod_payload = {
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": body.get("temperature", 0.7),
             "top_p": body.get("top_p", 0.9),
-        }).replace("'", "'\\''")
+            "stream": stream,
+        }
 
-        cmd = f"curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload}'"
-        result = lium.exec(pod, command=cmd)
-        stdout = result.get("stdout", "") if isinstance(result, dict) else str(result)
-
-        try:
-            data = json.loads(stdout)
-            if "choices" in data:
-                resp = {
-                    "response": data["choices"][0]["message"]["content"],
-                    "model": king_model,
-                    "king_uid": king_uid,
-                }
-                if "thinking" in data:
-                    resp["thinking"] = data["thinking"]
-                if "usage" in data:
-                    resp["usage"] = data["usage"]
-                return resp
-            return {"error": "unexpected response", "details": stdout[:300]}
-        except json.JSONDecodeError:
-            return {"error": "chat server not responding — may be starting up", "details": stdout[:300]}
+        if stream:
+            return _stream_chat(lium, pod, pod_payload, king_uid, king_model)
+        else:
+            return _sync_chat(lium, pod, pod_payload, king_uid, king_model)
 
     except Exception as e:
         return {"error": f"chat error: {str(e)[:200]}"}
 
 
+def _sync_chat(lium, pod, payload, king_uid, king_model):
+    """Non-streaming chat proxy."""
+    payload["stream"] = False
+    payload_str = json.dumps(payload).replace("'", "'\\''")
+    cmd = f"curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload_str}'"
+    result = lium.exec(pod, command=cmd)
+    stdout = result.get("stdout", "") if isinstance(result, dict) else str(result)
+
+    try:
+        data = json.loads(stdout)
+        if "choices" in data:
+            resp = {
+                "response": data["choices"][0]["message"]["content"],
+                "model": king_model,
+                "king_uid": king_uid,
+            }
+            if "thinking" in data:
+                resp["thinking"] = data["thinking"]
+            if "usage" in data:
+                resp["usage"] = data["usage"]
+            return resp
+        return {"error": "unexpected response", "details": stdout[:300]}
+    except json.JSONDecodeError:
+        return {"error": "chat server not responding — may be starting up", "details": stdout[:300]}
+
+
+def _stream_chat(lium, pod, payload, king_uid, king_model):
+    """Streaming chat proxy via SSE. Uses lium.stream_exec to pipe pod SSE → client."""
+    payload_str = json.dumps(payload).replace("'", "'\\''")
+    cmd = f"curl -sN -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload_str}'"
+
+    def generate():
+        try:
+            for chunk in lium.stream_exec(pod, command=cmd):
+                data = chunk.get("data", "")
+                if not data:
+                    continue
+                # Forward SSE lines from pod curl
+                for line in data.split("\n"):
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            parsed = json.loads(raw)
+                            # Inject king info
+                            parsed["king_uid"] = king_uid
+                            parsed["king_model"] = king_model
+                            yield f"data: {json.dumps(parsed)}\n\n"
+                        except json.JSONDecodeError:
+                            yield f"data: {raw}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+_chat_restart_lock = threading.Lock()
+_last_chat_restart = 0.0
+
+
+def _ensure_chat_server(lium, pod, king_model=None):
+    """Auto-start chat server if not running. Rate-limited to once per 2 min."""
+    global _last_chat_restart
+    with _chat_restart_lock:
+        if time.time() - _last_chat_restart < 120:
+            return  # Already tried recently
+        _last_chat_restart = time.time()
+
+    model_name = king_model or "aceini/q-dist"
+    try:
+        # Check if already running
+        r = lium.exec(pod, command="pgrep -f chat_server.py || echo not_running")
+        stdout = r.get("stdout", "") if isinstance(r, dict) else ""
+        if "not_running" in stdout:
+            print(f"[chat] Auto-starting chat server for {model_name}", flush=True)
+            lium.exec(pod, command=f"nohup python3 /root/chat_server.py {model_name} {CHAT_POD_PORT} > /tmp/chat_server.log 2>&1 &")
+    except Exception as e:
+        print(f"[chat] Auto-restart failed: {e}", flush=True)
+
+
 @app.get("/api/chat/status")
 def chat_status():
-    """Check if the king chat server is available."""
+    """Check if the king chat server is available. Auto-starts if down."""
     king_uid, king_model = _get_king_info()
     progress = _safe_json_load(os.path.join(STATE_DIR, "eval_progress.json"), {})
     eval_active = progress.get("active", False)
@@ -882,6 +962,9 @@ def chat_status():
             stdout = result.get("stdout", "") if isinstance(result, dict) else ""
             if '"status": "ok"' in stdout or '"status":"ok"' in stdout:
                 server_ok = True
+            elif not eval_active:
+                # Server not responding and no eval in progress — auto-restart
+                _ensure_chat_server(lium, pod, king_model)
     except Exception:
         pass
 
