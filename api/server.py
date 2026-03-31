@@ -795,15 +795,21 @@ def _get_king_info():
     return king_uid, None
 
 
-def _lium_pod():
-    """Get Lium client and pod."""
+def _lium_pod(name_hint="chat-king"):
+    """Get Lium client and pod. Prefers chat-king pod, falls back to distil-eval."""
     from lium import Lium, Config
     from pathlib import Path
     lium_key = os.environ.get("LIUM_API_KEY")
     if not lium_key:
         return None, None
     lium = Lium(config=Config(api_key=lium_key, ssh_key_path=str(Path.home() / ".ssh" / "id_ed25519")))
-    for p in lium.ps():
+    pods = lium.ps()
+    # Prefer chat-king pod
+    for p in pods:
+        if getattr(p, "name", "") == name_hint:
+            return lium, p
+    # Fallback to distil-eval
+    for p in pods:
         if "distil" in str(getattr(p, "name", "")).lower():
             return lium, p
     return None, None
@@ -814,7 +820,7 @@ async def chat_with_king(request: Request):
     """Proxy chat to the king model running on the GPU pod."""
     body = await request.json()
     messages = body.get("messages", [])
-    max_tokens = min(body.get("max_tokens", 512), 1024)
+    max_tokens = body.get("max_tokens", 2048)  # No hard cap
 
     if not messages:
         return {"error": "messages required"}
