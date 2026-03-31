@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Chat server for the king model. Runs on GPU pod, port 8100.
-Supports streaming, thinking/answer separation, concurrent requests.
-~8GB VRAM for a 4B model.
+Features: SSE streaming, thinking/answer split, concurrent requests, no token cap.
+~8GB VRAM for a 4B model. HF transformers backend (~37 tok/s on B200).
 """
 import json
 import sys
@@ -25,37 +25,7 @@ model.eval()
 vram_gb = round(torch.cuda.memory_allocated() / 1e9, 1)
 print(f"[chat] Model loaded. VRAM: {vram_gb}GB", flush=True)
 
-# Lock for sequential GPU access (model isn't thread-safe for generate)
 _gen_lock = threading.Lock()
-
-
-def _split_thinking(text):
-    """Split response into thinking and answer parts."""
-    # <think>...</think> pattern (greedy — grab everything inside)
-    think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-    if think_match:
-        thinking = think_match.group(1).strip()
-        answer = text[think_match.end():].strip()
-        return thinking, answer if answer else "(model stopped during thinking)"
-    
-    # Model started with <think> but didn't close it (hit max_tokens)
-    if text.lstrip().startswith("<think>"):
-        content = text.lstrip()[7:].strip()  # Remove <think>
-        return content, "(thinking was cut short — try a longer max_tokens)"
-    
-    # "Thinking Process:" or similar headers
-    for header in ["Thinking Process:", "Thought:", "Reasoning:", "Let me think", "**Thinking"]:
-        if text.startswith(header):
-            parts = re.split(r'\n\n(?=[A-Z]|\*\*)', text, maxsplit=1)
-            if len(parts) == 2:
-                return parts[0].strip(), parts[1].strip()
-    
-    # Qwen3.5 sometimes starts with reasoning before </think>
-    if "\n</think>\n" in text:
-        parts = text.split("\n</think>\n", 1)
-        return parts[0].strip(), parts[1].strip()
-    
-    return None, text
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -67,7 +37,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
         messages = body.get("messages", [])
-        max_tokens = min(body.get("max_tokens", 512), 1024)
+        max_tokens = body.get("max_tokens", 2048)  # No hard cap
         temperature = body.get("temperature", 0.7)
         top_p = body.get("top_p", 0.9)
         stream = body.get("stream", False)
@@ -77,9 +47,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 messages, tokenize=False, add_generation_prompt=True
             )
         except Exception:
-            parts = []
-            for m in messages:
-                parts.append(f"{m.get('role', 'user')}: {m.get('content', '')}")
+            parts = [f"{m.get('role','user')}: {m.get('content','')}" for m in messages]
             parts.append("assistant:")
             text = "\n".join(parts)
 
@@ -108,36 +76,26 @@ class ChatHandler(BaseHTTPRequestHandler):
         elapsed = time.time() - t0
         new_tokens = output[0][input_len:]
         n_tokens = len(new_tokens)
-        response_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        raw = tokenizer.decode(new_tokens, skip_special_tokens=True)
         tps = n_tokens / elapsed if elapsed > 0 else 0
 
-        thinking, answer = _split_thinking(response_text)
+        thinking, answer = _split_thinking(raw)
 
         result = {
-            "choices": [{
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop",
-            }],
+            "choices": [{"message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
             "model": MODEL_NAME,
-            "usage": {
-                "completion_tokens": n_tokens,
-                "tokens_per_second": round(tps, 1),
-                "generation_time_s": round(elapsed, 2),
-            },
+            "usage": {"completion_tokens": n_tokens, "tokens_per_second": round(tps, 1), "generation_time_s": round(elapsed, 2)},
         }
         if thinking:
             result["thinking"] = thinking
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode())
+        self._send_json(200, result)
 
     def _stream_response(self, gen_kwargs, input_len):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -145,9 +103,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         gen_kwargs["streamer"] = streamer
 
         t0 = time.time()
-        n_tokens = 0
-        full_text = ""
-        in_thinking = None  # None = not determined, True = in thinking, False = in answer
+        n_tokens = [0]
+        full_text = []
+        phase = ["thinking"]  # start assuming thinking
+        think_done = [False]
 
         def generate():
             with _gen_lock:
@@ -159,76 +118,73 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         try:
             for chunk in streamer:
-                full_text += chunk
-                n_tokens += len(tokenizer.encode(chunk, add_special_tokens=False))
+                full_text.append(chunk)
+                joined = "".join(full_text)
+                n_tokens[0] += max(1, len(tokenizer.encode(chunk, add_special_tokens=False)))
                 elapsed = time.time() - t0
-                tps = n_tokens / elapsed if elapsed > 0 else 0
+                tps = n_tokens[0] / elapsed if elapsed > 0 else 0
 
-                # Determine if we're in thinking or answer phase
-                if in_thinking is None:
-                    for header in ["<think>", "Thinking Process:", "Thought:", "Reasoning:", "Let me think", "**Thinking"]:
-                        if full_text.startswith(header):
-                            in_thinking = True
-                            break
-                    if in_thinking is None and len(full_text) > 20:
-                        in_thinking = False
+                # Detect phase transitions
+                current_phase = phase[0]
+                if not think_done[0]:
+                    if "</think>" in joined:
+                        think_done[0] = True
+                        phase[0] = "answer"
+                        # Split: send the answer portion only
+                        after_think = joined.split("</think>", 1)[1]
+                        # Send transition event
+                        self._sse({"choices": [{"delta": {"phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
+                        if after_think.strip():
+                            self._sse({"choices": [{"delta": {"content": after_think.strip(), "phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
+                        continue
+                    # Check if model didn't use think tags at all (first 50 chars)
+                    if len(joined) > 50 and "<think>" not in joined[:50]:
+                        think_done[0] = True
+                        phase[0] = "answer"
 
-                # Check for thinking→answer transition
-                phase = "thinking" if in_thinking else "answer"
-                if in_thinking:
-                    if "</think>" in full_text:
-                        in_thinking = False
-                        phase = "answer"
-                    elif "\n\n" in full_text and len(full_text) > 100:
-                        # Heuristic: double newline after substantial thinking = transition
-                        remaining = full_text.split("\n\n", 1)[-1]
-                        if remaining and remaining[0].isupper():
-                            in_thinking = False
-                            phase = "answer"
+                # Clean chunk: strip <think> tag from output
+                clean = chunk.replace("<think>", "").replace("</think>", "")
+                if not clean:
+                    continue
 
-                event = {
-                    "choices": [{
-                        "delta": {"content": chunk, "phase": phase},
-                        "finish_reason": None,
-                    }],
+                self._sse({
+                    "choices": [{"delta": {"content": clean, "phase": phase[0]}, "finish_reason": None}],
                     "usage": {"tokens_per_second": round(tps, 1)},
-                }
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                self.wfile.flush()
-
+                })
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             thread.join()
 
         elapsed = time.time() - t0
-        tps = n_tokens / elapsed if elapsed > 0 else 0
-        done_event = {
-            "choices": [{"delta": {}, "finish_reason": "stop"}],
-            "usage": {
-                "completion_tokens": n_tokens,
-                "tokens_per_second": round(tps, 1),
-                "generation_time_s": round(elapsed, 2),
-            },
-        }
+        tps = n_tokens[0] / elapsed if elapsed > 0 else 0
         try:
-            self.wfile.write(f"data: {json.dumps(done_event)}\n\n".encode())
+            self._sse({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"completion_tokens": n_tokens[0], "tokens_per_second": round(tps, 1), "generation_time_s": round(elapsed, 2)},
+            })
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _sse(self, data):
+        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        self.wfile.flush()
+
+    def _send_json(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
     def do_GET(self):
         if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "ok",
-                "model": MODEL_NAME,
+            self._send_json(200, {
+                "status": "ok", "model": MODEL_NAME,
                 "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 1),
-            }).encode())
+            })
         else:
             self.send_error(404)
 
@@ -240,15 +196,31 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        pass  # Silent
+        pass
+
+
+def _split_thinking(text):
+    """Split <think>...</think> from answer."""
+    if "</think>" in text:
+        parts = text.split("</think>", 1)
+        thinking = parts[0].replace("<think>", "").strip()
+        answer = parts[1].strip()
+        return thinking, answer if answer else "(stopped during thinking)"
+    if text.lstrip().startswith("<think>"):
+        return text.lstrip()[7:].strip(), "(thinking cut short)"
+    # Heuristic fallback for "Thinking Process:" style
+    for header in ["Thinking Process:", "Thought:", "Reasoning:"]:
+        if text.startswith(header):
+            parts = re.split(r'\n\n(?=[A-Z*])', text, maxsplit=1)
+            if len(parts) == 2:
+                return parts[0].strip(), parts[1].strip()
+    return None, text
 
 
 class ThreadedHTTPServer(HTTPServer):
-    """Handle each request in a new thread for concurrent access."""
     def process_request(self, request, client_address):
-        thread = threading.Thread(target=self._handle, args=(request, client_address))
-        thread.daemon = True
-        thread.start()
+        t = threading.Thread(target=self._handle, args=(request, client_address), daemon=True)
+        t.start()
 
     def _handle(self, request, client_address):
         try:
@@ -260,6 +232,6 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"[chat] Serving on port {PORT} (threaded)", flush=True)
+    print(f"[chat] Serving on port {PORT} (threaded, streaming)", flush=True)
     server = ThreadedHTTPServer(("0.0.0.0", PORT), ChatHandler)
     server.serve_forever()

@@ -320,6 +320,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             else:
                 raise RuntimeError(f"Failed to upload eval script after 5 attempts: {e}")
 
+    # ── Ensure pod has correct dependencies (transformers + torch) ──
+    try:
+        print("[VALIDATOR] Ensuring pod dependencies...", flush=True)
+        dep_result = lium.exec(pod, command=(
+            "pip install --upgrade transformers -q 2>&1 | tail -1 && "
+            "python3 -c 'import torch; import transformers; "
+            "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
+            "cuda={torch.cuda.is_available()}\")'"
+        ))
+        print(f"[VALIDATOR] Pod deps: {dep_result.get('stdout', '').strip()}", flush=True)
+    except Exception as e:
+        print(f"[VALIDATOR] Pod dep check failed (non-fatal): {e}", flush=True)
+
     while True:
         try:
             epoch_start = time.time()
@@ -957,12 +970,14 @@ else:
                 # reuse teacher logits and skip already-scored students.
                 # Build eval command — use vLLM script if enabled
                 king_flag = ""
-                vllm_persistent_flag = ""
-                if use_vllm and king_uid is not None and king_uid in models_to_eval:
-                    king_model_name = models_to_eval[king_uid]["model"]
-                    king_flag = f" --king {king_model_name}"
+                vllm_flag = ""
                 if use_vllm:
-                    vllm_persistent_flag = " --persistent-vllm --vllm-gpu-util 0.45"
+                    vllm_flag = " --persistent-vllm --vllm-gpu-util 0.45"
+                    if king_uid is not None and king_uid in models_to_eval:
+                        king_model_name = models_to_eval[king_uid]["model"]
+                        king_flag = f" --king {king_model_name}"
+                else:
+                    vllm_flag = " --no-vllm"
                 eval_cmd_core = (
                     f"cd /home && python3 -u pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -976,7 +991,7 @@ else:
                     f"--save-teacher-logits /home/teacher_cache.pt "
                     f"--resume"
                     f"{king_flag}"
-                    f"{vllm_persistent_flag}"
+                    f"{vllm_flag}"
                 )
                 # Tee output to log file for live streaming to dashboard
                 cmd = f"{eval_cmd_core} 2>&1 | tee /home/eval_output.log"
