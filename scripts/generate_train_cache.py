@@ -32,7 +32,7 @@ MAX_PROMPT_TOKENS = 1024
 
 @click.command()
 @click.option("--teacher-model", default=TEACHER_MODEL)
-@click.option("--num-prompts", type=int, default=60, help="Prompts to sample per block (matches validator)")
+@click.option("--num-prompts", type=int, default=40, help="Prompts to sample per block (matches validator)")
 @click.option("--num-blocks", type=int, default=500, help="Number of simulated blocks for diversity")
 @click.option("--output-dir", type=click.Path(), default="state/train_cache")
 @click.option("--device", default="cuda")

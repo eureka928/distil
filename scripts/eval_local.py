@@ -226,7 +226,7 @@ def evaluate_student(
 @click.command()
 @click.option("--student-repo", required=True, help="HuggingFace repo or local path to student model")
 @click.option("--revision", default="main", help="Model revision/commit SHA")
-@click.option("--num-prompts", type=int, default=60, help="Number of FineWeb prompts (validator uses 60)")
+@click.option("--num-prompts", type=int, default=40, help="Number of prompts (validator uses 40)")
 @click.option("--seed", type=int, default=42, help="Seed for prompt selection and teacher generation (simulates block number)")
 @click.option("--teacher-model", default=TEACHER_MODEL, help="Teacher model repo")
 @click.option("--king-kl", type=float, default=None, help="Current king's KL for comparison")
