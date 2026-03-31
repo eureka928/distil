@@ -59,7 +59,7 @@ def log_vram(label: str = ""):
     if torch.cuda.is_available():
         used = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
-        total = torch.cuda.get_device_properties(0).total_mem / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
         prefix = f"VRAM [{label}]" if label else "VRAM"
         logger.info(f"{prefix}: {used:.1f}GB allocated, {reserved:.1f}GB reserved / {total:.1f}GB total")
 
