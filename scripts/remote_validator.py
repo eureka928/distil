@@ -907,8 +907,8 @@ else:
                 if use_vllm and king_uid is not None and king_uid in models_to_eval:
                     king_model_name = models_to_eval[king_uid]["model"]
                     king_flag = f" --king {king_model_name}"
-                cmd = (
-                    f"cd /home && python3 pod_eval.py "
+                eval_cmd_core = (
+                    f"cd /home && python3 -u pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
                     f"--students {student_list} "
                     f"--prompts prompts.json "
@@ -921,6 +921,8 @@ else:
                     f"--resume"
                     f"{king_flag}"
                 )
+                # Tee output to log file for live streaming to dashboard
+                cmd = f"{eval_cmd_core} 2>&1 | tee /home/eval_output.log"
                 print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
                 # Update progress: scoring phase (clear stale data from previous eval)
@@ -937,6 +939,9 @@ else:
                 import threading
                 poll_stop = threading.Event()
                 progress_lock = threading.Lock()
+
+                # Log file path for pod output streaming
+                gpu_log_path = state_path / "gpu_eval.log"
 
                 def _poll_pod_progress():
                     while not poll_stop.is_set():
@@ -987,6 +992,16 @@ else:
                                     json.dump(progress, f)
                         except Exception:
                             pass
+
+                        # Fetch pod stdout log (last 100 lines)
+                        try:
+                            log_result = lium.exec(pod, command="tail -100 /home/eval_output.log 2>/dev/null || echo ''")
+                            log_text = log_result.get("stdout", "")
+                            if log_text.strip():
+                                gpu_log_path.write_text(log_text)
+                        except Exception:
+                            pass
+
                         poll_stop.wait(5)
 
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)

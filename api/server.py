@@ -541,37 +541,53 @@ def health():
 
 @app.get("/api/gpu-logs")
 def gpu_logs(lines: int = 50):
-    """Stream recent GPU eval logs from the validator PM2 process.
-    Returns the last N lines of GPU-related output for transparency."""
+    """Stream recent GPU eval logs — combines pod output + validator events."""
+    import subprocess
+    import re
+    ansi_re = re.compile(r'\x1b\[[0-9;]*m')
+    max_lines = min(lines, 200)
+    log_lines = []
+
+    # Source 1: Live GPU eval output from pod (streamed by poll thread)
+    gpu_log_path = os.path.join(STATE_DIR, "gpu_eval.log")
+    if os.path.exists(gpu_log_path):
+        try:
+            with open(gpu_log_path) as f:
+                pod_lines = f.read().strip().split('\n')
+            for line in pod_lines:
+                cleaned = ansi_re.sub('', line).strip()
+                if cleaned:
+                    log_lines.append(f"[GPU] {cleaned}")
+        except Exception:
+            pass
+
+    # Source 2: Validator PM2 logs (orchestrator events)
     try:
-        import subprocess
-        import re
         result = subprocess.run(
-            ["pm2", "logs", "distill-validator", "--lines", str(min(lines, 200)), "--nostream"],
+            ["pm2", "logs", "distill-validator", "--lines", str(max_lines), "--nostream"],
             capture_output=True, text=True, timeout=5
         )
         raw = result.stdout + result.stderr
-        ansi_re = re.compile(r'\x1b\[[0-9;]*m')
-        # Filter to interesting lines (GPU output, validator events, errors)
-        log_lines = []
         for line in raw.split('\n'):
-            # Strip ANSI codes
             cleaned = ansi_re.sub('', line)
-            # Strip PM2 prefix (id|name |)
             if '|' in cleaned:
                 cleaned = cleaned.split('|', 1)[-1].strip()
             if not cleaned:
                 continue
-            # Skip noisy lines
-            if any(skip in cleaned for skip in ['sftp', 'Authentication', 'Connected (version', 'chan 0', 'TAILING', 'last 50 lines', 'last 10 lines', 'last 20 lines']):
+            if any(skip in cleaned for skip in [
+                'sftp', 'Authentication', 'Connected (version', 'chan 0',
+                'TAILING', 'last 50 lines', 'last 10 lines', 'last 20 lines',
+                'Opened sftp', 'sftp session closed', 'Enabling default logging'
+            ]):
                 continue
             log_lines.append(cleaned)
-        return {
-            "lines": log_lines[-min(lines, 200):],
-            "count": len(log_lines),
-        }
-    except Exception as e:
-        return {"lines": [f"Error reading logs: {e}"], "count": 0}
+    except Exception:
+        pass
+
+    return {
+        "lines": log_lines[-max_lines:],
+        "count": len(log_lines),
+    }
 
 
 # ── Startup: prime caches ────────────────────────────────────────────────────
