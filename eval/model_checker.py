@@ -28,12 +28,19 @@ STATE_DIR = Path("state")
 
 def compute_moe_params(config: dict) -> dict:
     """
-    Compute total and active parameters for MoE models.
+    Compute total and active parameters for MoE and hybrid-attention models.
+
+    Handles:
+    - Dense models (uniform attention across all layers)
+    - MoE models (multiple experts per layer)
+    - Hybrid attention (mix of full and linear attention layers, e.g. Qwen3.5)
+    - Multi-token prediction heads (mtp_num_hidden_layers)
 
     Returns dict with:
         - total_params: all parameters including all experts
         - active_params: parameters active during a single forward pass
         - is_moe: whether model uses MoE
+        - has_hybrid_attention: whether model mixes linear and full attention
         - num_experts: total experts per layer
         - num_active_experts: experts active per token
     """
@@ -56,18 +63,48 @@ def compute_moe_params(config: dict) -> dict:
     head_dim = _get("head_dim", hidden // num_heads if num_heads else 0)
 
     if not all([hidden, layers, vocab]):
-        return {"total_params": 0, "active_params": 0, "is_moe": False}
+        return {"total_params": 0, "active_params": 0, "is_moe": False,
+                "has_hybrid_attention": False}
 
-    # Attention params per layer: Q + K + V + O
-    attn_per_layer = (
+    # ── Attention params ──────────────────────────────────────────────
+    # Full attention per layer: Q + K + V + O
+    full_attn_per_layer = (
         hidden * num_heads * head_dim  # Q
         + hidden * kv_heads * head_dim  # K
         + hidden * kv_heads * head_dim  # V
         + num_heads * head_dim * hidden  # O
     )
-    total_attn = layers * attn_per_layer
 
-    # Embeddings: input + output (may share weights)
+    # Detect hybrid attention (e.g. Qwen3.5 with linear + full attention layers)
+    layer_types = config.get("layer_types", None) or text_cfg.get("layer_types", None)
+    has_hybrid = layer_types is not None and "linear_attention" in layer_types
+
+    if has_hybrid:
+        # Linear attention uses different head dims and counts
+        lin_key_heads = config.get("linear_num_key_heads", kv_heads)
+        lin_key_dim = config.get("linear_key_head_dim", head_dim)
+        lin_val_heads = config.get("linear_num_value_heads", kv_heads)
+        lin_val_dim = config.get("linear_value_head_dim", head_dim)
+        conv_kernel = config.get("linear_conv_kernel_dim", 0)
+
+        linear_attn_per_layer = (
+            hidden * num_heads * head_dim  # Q (same as full attention)
+            + hidden * lin_key_heads * lin_key_dim  # K
+            + hidden * lin_val_heads * lin_val_dim  # V
+            + num_heads * head_dim * hidden  # O
+        )
+        # Conv kernel adds per-channel weights per linear attention layer
+        if conv_kernel:
+            linear_attn_per_layer += conv_kernel * hidden
+
+        n_full = sum(1 for lt in layer_types if lt == "full_attention")
+        n_linear = sum(1 for lt in layer_types if lt == "linear_attention")
+
+        total_attn = n_full * full_attn_per_layer + n_linear * linear_attn_per_layer
+    else:
+        total_attn = layers * full_attn_per_layer
+
+    # ── Embeddings: input + output (may share weights) ────────────────
     tie_word = config.get("tie_word_embeddings", False)
     embed_params = vocab * hidden * (1 if tie_word else 2)
 
@@ -100,10 +137,19 @@ def compute_moe_params(config: dict) -> dict:
     total_params = total_attn + total_ffn + embed_params + norm_params
     active_params = total_attn + active_ffn + embed_params + norm_params
 
+    # ── Multi-token prediction head (extra decoder layers) ────────────
+    mtp_layers = config.get("mtp_num_hidden_layers", 0) or text_cfg.get("mtp_num_hidden_layers", 0)
+    if mtp_layers:
+        # MTP adds extra transformer-like layers (use full-attention estimate)
+        mtp_params = mtp_layers * (full_attn_per_layer + ffn_per_expert + hidden * 4)
+        total_params += mtp_params
+        active_params += mtp_params
+
     return {
         "total_params": total_params,
         "active_params": active_params,
         "is_moe": is_moe,
+        "has_hybrid_attention": has_hybrid,
         "num_experts": num_experts,
         "num_active_experts": num_active,
     }
@@ -544,6 +590,8 @@ def check_model_architecture(
                 f"{moe_info['num_active_experts']} active/token, "
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
+        if moe_info.get("has_hybrid_attention"):
+            logger.info(f"  Hybrid attention model: config estimate={config_total_b:.2f}B")
 
         return {
             "pass": True,
@@ -552,6 +600,7 @@ def check_model_architecture(
             "active_params_b": config_active_b,
             "vocab_size": vocab_size,
             "is_moe": moe_info["is_moe"],
+            "has_hybrid_attention": moe_info.get("has_hybrid_attention", False),
         }
 
     except Exception as e:
